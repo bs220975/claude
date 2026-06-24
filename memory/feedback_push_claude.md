@@ -1,17 +1,57 @@
 ---
 name: feedback-push-claude
-description: "When user says 'push claude', update CLAUDE.md and push to GitHub claude-brain repo without asking for confirmation"
+description: "When user says 'push claude', sync CLAUDE.md + memory to GitHub claude-brain repo from whichever device is active — no confirmation needed"
 metadata:
   type: feedback
 ---
 
-When the user says **"push claude"**, immediately and without asking:
-1. Pull latest first: `git -C /home/pi/claude-brain pull --ff-only 2>/dev/null`
-2. Copy memory files: `cp /home/pi/.claude/projects/-home-pi-pi4-drive-Git-projects-RASPI4-MAIN/memory/*.md /home/pi/claude-brain/memory/`
-3. `git -C /home/pi/claude-brain add .`
-4. `git -C /home/pi/claude-brain commit -m "Update brain — <brief summary of what changed>"`
-5. `git -C /home/pi/claude-brain push origin main`
+When the user says **"push claude"**, immediately and without asking, detect the active device by home directory and run the matching sequence:
 
-**Why:** User wants a single short command to sync their system brain to GitHub so all devices get the update. No confirmation needed — Bash(*) is already in global settings so no permission prompts.
+**Why:** User wants a single short command to sync their brain to GitHub so any device pulls fresh context on next launch. No confirmation needed.
 
-**How to apply:** The moment "push claude" appears in the user's message, execute all steps above in sequence. Do not ask "are you sure" or "should I push". Just do it.
+---
+
+## Device: Pi5 (working dir starts with /home/pi5)
+
+```bash
+BRAIN=/home/pi5/claude-brain
+PROJECT_MD=/home/pi5/pi5_drive/Git_projects/RASPI5-MAIN/CLAUDE.md
+MEM_SRC=/home/pi5/.claude/projects/-home-pi5-pi5-drive-Git-projects-RASPI5-MAIN/memory
+
+git -C $BRAIN pull --ff-only --quiet 2>/dev/null
+cp $PROJECT_MD $BRAIN/CLAUDE.md
+cp $MEM_SRC/*.md $BRAIN/memory/ 2>/dev/null
+git -C $BRAIN add .
+git -C $BRAIN commit -m "Update brain — Pi5: <brief summary>"
+git -C $BRAIN push origin main
+```
+
+## Device: Pi4 (working dir starts with /home/pi/)
+
+```bash
+BRAIN=/home/pi/claude-brain
+PROJECT_MD=/home/pi/pi4_drive/Git_projects/RASPI4-MAIN/CLAUDE.md
+MEM_SRC=/home/pi/.claude/projects/-home-pi-pi4-drive-Git-projects-RASPI4-MAIN/memory
+
+git -C $BRAIN pull --ff-only --quiet 2>/dev/null
+cp $PROJECT_MD $BRAIN/CLAUDE.md
+cp $MEM_SRC/*.md $BRAIN/memory/ 2>/dev/null
+git -C $BRAIN add .
+git -C $BRAIN commit -m "Update brain — Pi4: <brief summary>"
+git -C $BRAIN push origin main
+```
+
+## Device: PC (working dir is neither above)
+
+```bash
+BRAIN=~/claude-brain
+git -C $BRAIN pull --ff-only --quiet 2>/dev/null
+cp ~/.claude/CLAUDE.md $BRAIN/CLAUDE.md
+CWD_ENCODED=$(pwd | sed 's|/|-|g')
+cp ~/.claude/projects/${CWD_ENCODED}/memory/*.md $BRAIN/memory/ 2>/dev/null
+git -C $BRAIN add .
+git -C $BRAIN commit -m "Update brain — PC: <brief summary>"
+git -C $BRAIN push origin main
+```
+
+**How to apply:** Check the working directory at the start of the conversation (`/home/pi5/` → Pi5, `/home/pi/` → Pi4, else PC). Execute the matching block. No confirmation prompt.
