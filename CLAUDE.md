@@ -472,6 +472,219 @@ Pi5 checks `ip addr show wlan0` for `192.168.1.100` before sending:
 
 ---
 
+## HOMESECURITY-APP — Flutter App
+
+**Path:** `/home/pi5/pi5_drive/Git_projects/HOMESECURITY-APP/`
+**Package:** `com.homesecurity.alertapp`
+**Platforms:** Android (primary) + Windows
+**Min Android SDK:** 21, Target: 34
+
+### App Features
+
+| Module | Description |
+|--------|-------------|
+| Lights | Toggle relays; all-on/off; daily scheduler |
+| Door Status | Live open/closed per door; Door1–Door4; rename/locate/enable |
+| Radar / Motion | Live alerts from ESP32 via AWS IoT Shadow + FCM |
+| DHT11 | Live temp & humidity; 24h/7d graph |
+| Energy Meter | Live voltage, current, power; historical graph |
+| Event Logs | 4-tab live log (All/Motion/Door/Other); Firestore-backed history |
+| Sensors & Devices | All IoT device heartbeat status |
+| OTA | Trigger firmware OTA on ESP32 from app |
+| Bot Commands | Send commands to Pi Telegram bot |
+| Lights Scheduler | Daily on/off timers synced to Pi via Firebase |
+| Grocery List | Shared list (Firestore) |
+| Electronics Inventory | Component inventory with AI import (Firestore) |
+
+### App Architecture — Light Control
+
+```
+App tap → Firebase RTDB lights/{id}/state
+              └── Pi SSE → MQTT → relay
+
+App tap (Wi-Fi) → HTTP PUT Pi:5757/lights/{id}   (LAN fallback, ~50ms)
+              └── Pi local_api_server → MQTT → relay
+
+Speed: local ~50–100 ms vs Firebase ~500 ms–2 s
+End-to-end app toggle: ~3–4 s total (Firebase path)
+End-to-end motion: ~300 ms (direct LAN)
+```
+
+### Local Wi-Fi Fallback
+
+- Pi local API port: `5757`
+- Test: `http://192.168.1.100:5757/ping` → `{"ok": true}`
+- Default Pi IP stored in SharedPreferences key `local_pi_ip` (default `192.168.1.100`)
+- Configure in app: Lights page → VIP chip → enter IP → Save & Test
+- Connectivity banner: Green=local, Amber=Firebase, Red=offline
+
+### AWS IoT
+
+**Endpoint:** `a3m8azs2x620qd-ats.iot.us-east-1.amazonaws.com:8883` (mTLS)
+**Thing:** `all_sensors`
+
+| Shadow | Purpose | Key fields |
+|--------|---------|------------|
+| `doors` | Reed switch states | `door1.state`, `door1.timestamp`, `door1.sensor_id` |
+| `radars` | Radar motion levels | `radar1.state` (low/high), `radar1.timestamp` |
+| `device_status` | Universal heartbeat (all devices) | `{device_id}.timestamp`, `.type`, `.uptime` |
+
+**Flutter subscriptions per shadow:**
+```
+$aws/things/all_sensors/shadow/name/{shadow}/get/accepted
+$aws/things/all_sensors/shadow/name/{shadow}/update/accepted
+$aws/things/all_sensors/shadow/name/{shadow}/update/delta
+```
+
+**Device heartbeat:** every 120 s → AWS IoT Shadow `device_status`
+**isOnline threshold:** lastSeen < 3 min ago
+
+**AWS Certs (not committed):** place in `assets/certs/`:
+- `AmazonRootCA1.pem`, `certificate.pem.crt`, `private.pem.key`
+
+### Door IDs (hardware)
+
+| ID | Maps to |
+|----|---------|
+| `Door1` | Reed switch 1 on Raspberry Pi (GPIO 26) |
+| `Door2` | Reed switch 2 on Raspberry Pi |
+| `Door3` | Reed switch 3 on Raspberry Pi |
+| `Door4` | Reed switch 4 (disabled by default) |
+
+**Firestore doc_id formula** (must match Pi + Lambda + App):
+```
+Door{N}_{state}_{epoch_seconds}
+e.g. Door1_open_1779627685
+```
+
+### Door Event Paths (3 paths, deduped)
+
+```
+Pi reed switch → Path A: Firestore REST door_events/{doc_id}  (primary persistence)
+              → Path B: AWS IoT Shadow → Flutter MQTT (UI only on Android)
+              → Path C: Lambda → FCM push → App (Firestore + Event Log + notification)
+```
+
+### App Firestore Collections
+
+| Collection | Writer | Retention |
+|------------|--------|-----------|
+| `door_events` | Pi + Lambda + App | 50 docs, 30 days |
+| `motion_events` | App (high motion only) | 30 docs, 30 days |
+| `sensor_history/dht11/readings` | DHT11 service | 30 days |
+| `sensor_history/energy/readings` | Energy meter | 30 days |
+| `devices` | Device registry | — |
+
+### App Firebase RTDB Paths
+
+| Path | Purpose |
+|------|---------|
+| `lights/` | state + confirmed per light |
+| `devices/RASPI-4/` | Pi heartbeat |
+| `devices/ESP01-LL-RLY/` | Lobby relay state |
+| `devices/esp01_relay/` | Porch relay state |
+| `devices/ESP32-LP-RLY/` | LP relay state |
+| `schedules/` | Daily on/off timer settings per light |
+
+### App Build & Debug Commands
+
+```bash
+# Build and run
+flutter pub get
+flutter run
+
+# Build debug APK
+flutter build apk --debug
+
+# Install to device
+adb install build/app/outputs/flutter-apk/app-debug.apk
+adb install .\build\app\outputs\flutter-apk\app-debug.apk  # Windows
+
+# Uninstall
+adb uninstall com.homesecurity.alertapp
+
+# Logs
+adb logcat -s flutter
+```
+
+---
+
+## ESP Device Details — OTA & Telegram Commands
+
+### OTA Flash Commands (all devices)
+
+```bash
+# ESP32-LP-RDR1 (main radar, 192.168.1.87)
+cd /home/pi5/pi5_drive/Git_projects/ESP32-LP-RDR1
+/home/pi5/.platformio/penv/bin/pio run -e esp32_lp_rdr1_ota --target upload
+# Or via Telegram: /ota2
+
+# ESP01-LL-RLY (lower lobby, 192.168.1.85) — run from Pi4
+cd /home/pi/pi4_drive/Git_projects/ESP01-LL-RLY
+~/.platformio/penv/bin/platformio run -e esp01_relay_ota --target upload
+# OTA hostname: ESP01-LL-RLY  upload port: 192.168.1.85
+# ⚠️ After USB flash: power cycle required before OTA works
+
+# ESP01-UL-RLY (upper lobby, 192.168.1.111)
+# OTA hostname: esp01-relay
+
+# ESP32-LP-RLY (lower porch, 192.168.1.89)
+cd /home/pi5/pi5_drive/Git_projects/ESP32-LP-RLY
+/home/pi5/.platformio/penv/bin/pio run --target upload
+# OTA hostname: ESP32-LP-RLY  port: 3232  password: otaesp32
+```
+
+### ESP32-LP-RDR1 Telegram Bot Commands (suffix "2")
+
+All commands sent to chat ID `6825638285`, all end with `2`:
+
+| Category | Commands |
+|----------|---------|
+| Status | `/start2` `/status2` `/info2` `/ping2` `/deviceid2` `/devices2` `/checkdevices2` |
+| Radar | `/radar_on2` `/radar_off2` `/radar_status2` |
+| WiFi | `/wifi2` `/wifi_current2` `/wifi_scan2` `/wifi_add2 SSID PASS` `/wifi_remove2 SSID` `/wifi_priority2 SSID N` `/wifi_connect2 SSID` `/wifi_clearall2` |
+| Device IPs | `/setlightip2 IP` `/setcameraip2 IP` `/dellightip2` `/delcameraip2` |
+| Maintenance | `/ota2` `/restart2` `/tgreset2` `/help2` |
+
+### ESP32-LP-RDR1 NVS Config (persisted)
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `radar` | true | Radar motion enabled |
+| `porch_ip` | 192.168.1.111 | ESP01-UL-RLY IP |
+| `camera_ip` | 192.168.1.83 | Camera ESP IP |
+| `aws` | true | AWS IoT enabled |
+| `tg` | true | Telegram enabled |
+
+### ESP01-UL-RLY Control Flow
+
+```
+App tap → Firebase lights/lobby/state
+  └── ESP32-LP-RDR1 polls every 2s → caches s_lobbyCommandedState
+        └── ESP01-UL-RLY polls :81/relay/lobby/state every 1s
+              └── setRelay() → reportConfirmedToESP32()
+                    └── ESP32 writes lights/lobby/{state,confirmed} → App bulb
+```
+
+**Timers:**
+- Firebase poll: 2 s
+- ESP01 poll: 1 s
+- ESP32 health check of ESP01: 30 s
+- Motion light-off timer: 5 min
+- ESP01 firmware auto-off: 3 min (safety net only — Pi manages all timers)
+- ESP01-LL-RLY auto-off: **DISABLED** (`LIGHT_AUTO_OFF_MS=0`) — Pi controls all timers
+
+### Camera ESP Device
+
+| Item | Value |
+|------|-------|
+| Default IP | `192.168.1.83` |
+| Project | `ESP32-S3-XIAO-CAMERA` or `ESP32-CAM` |
+| Triggered by | ESP32-LP-RDR1 via HTTP `GET /radar_trigger` (throttled 60 s) |
+| Purpose | Photo on motion → Telegram |
+
+---
+
 ## Git Repositories
 
 ### On Pi5 (`/home/pi5/pi5_drive/Git_projects/`)
