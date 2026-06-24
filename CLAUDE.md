@@ -419,13 +419,17 @@ Flutter app taps light switch
 ```
 ESP32-LP-RDR1 radar detects motion
   ├── MQTT home/esp32/radar1/motion=ON → Pi4 broker
-  │     ├── Pi4 mybot: night? → MQTT cmd → ESP01-LL-RLY or ESP01-UL-RLY ON
-  │     └── bridges to Pi5 → Pi5 mybot: camera recording + Telegram video
-  ├── MQTT home/pi5/lp-rdr/motion=ON → Pi5 direct
-  │     └── Pi5 mybot: camera recording + Telegram video
+  │     ├── Pi4 _handle_radar_lp_rly(): night? → MQTT cmd → ESP32-LP-RLY ON
+  │     ├── Pi4 _trigger_light_control(): night? → MQTT cmd → ESP01-LL-RLY ON
+  │     └── bridges home/esp32/radar1/# → Pi5 broker → Pi5 _do_radar_motion_on()
+  │           → Pi5 night? → MQTT cmd → ESP32-LP-RLY ON (idempotent if Pi4 already sent)
+  ├── MQTT home/pi5/lp-rdr/motion=ON → Pi5 direct (ESP32-LP-RDR1 dual-publishes)
+  │     └── Pi5 camera recording + Telegram video
   ├── Telegram direct (throttled 60 s) — Pi-independent
   └── AWS IoT → Lambda → FCM (app siren) — Pi-independent
 ```
+
+Note: ESP32-LP-RDR1 publishes to **two brokers** simultaneously — Pi4 for LL/UL relay control, Pi5 direct for camera + LP-RLY duplicate trigger. Both `home/esp32/radar1/#` (bridged) and `home/pi5/lp-rdr/motion` (direct) arrive at Pi5.
 
 ### Motion → Light OFF (5-min timer)
 
@@ -453,6 +457,65 @@ Pi5 checks `ip addr show wlan0` for `192.168.1.100` before sending:
 - Firebase updates from relay state changes
 - App command responses
 - Scheduler-triggered commands
+
+**Pattern — always use this exact form:**
+```python
+try:
+    vip = subprocess.run(['ip', 'addr', 'show', 'wlan0'],
+                         capture_output=True, text=True, timeout=2)
+    is_master = '192.168.1.100' in vip.stdout
+except Exception:
+    is_master = False  # FAIL-SAFE: never except: pass (that's fail-open = Pi5 acts as master on timeout)
+```
+
+**Three places is_master MUST be applied in every `_on_*_mqtt_state` handler:**
+1. **Relay command re-sends** — firmware auto-off guard: `if not relay_on and _last_cmd and is_master: re-send ON`
+2. **Firebase writes** — `if is_master: push Firebase`
+3. **State variable updates** — `_last_*_cmd = relay_on` (always update, no VIP needed — this tracks local knowledge)
+
+### Distributed state problem (Pi4 vs Pi5 — critical for debugging)
+
+Pi4 and Pi5 each maintain **independent copies** of every state variable (`_last_lp_rly_cmd`, `_lp_rly_motion_triggered`, `_lp_rly_manual_off_time`, etc.). They are NOT synchronized directly.
+
+| Variable | How Pi5 learns Pi4's actions |
+|----------|------------------------------|
+| `_last_lp_rly_cmd` | Updated when Pi5 receives MQTT state feedback via bridge — lags by one round-trip |
+| `_lp_rly_manual_off_time` | Updated from Firebase SSE `_on_firebase_lp_rly_cmd(False)` — Pi4 writes Firebase after state=OFF arrives, then Pi5 SSE fires |
+| `_lp_rly_motion_triggered` | Pi5 only knows its own radar triggers; doesn't know Pi4's |
+
+**Consequence:** When Pi4 sends LP-RLY OFF, Pi5's `_last_lp_rly_cmd` is still True until the MQTT state=OFF message arrives via bridge. If the firmware auto-off guard fires in that window WITHOUT `is_master`, Pi5 re-sends ON → toggle loop.
+
+**Why `_*_manual_off_time` must be updated from Firebase SSE (not just `_execute_*_cmd`):**
+When Pi4 is master, Pi5 never calls `_execute_lp_rly_cmd` — only Pi4 does. So Pi5's `_lp_rly_manual_off_time` would never be set by `_execute_lp_rly_cmd`. The only reliable way for Pi5 to learn of a manual OFF is via Firebase SSE (`_on_firebase_lp_rly_cmd(False)`), which fires whether the OFF was initiated by the app via local HTTP to Pi4 or directly via Firebase.
+
+### LP-RLY Dual-Pi Control — How It All Connects
+
+LP-RLY (porch light) is unique: **both Pis can independently command it**, because the radar (ESP32-LP-RDR1) publishes motion to BOTH brokers (`home/esp32/radar1/motion` → Pi4 via bridge, and `home/pi5/lp-rdr/motion` → Pi5 direct).
+
+**App turns porch light OFF via local HTTP (Pi4 master):**
+```
+App PUT 192.168.1.100:5757/lights/lower_porch_light
+  └── Pi4 _execute_lp_rly_cmd(False)
+        → Pi4: _last_lp_rly_cmd=False, _lp_rly_manual_off_time=now
+        → MQTT home/switches/L-Porch-Light/cmd=OFF → ESP32-LP-RLY
+              → relay OFF → publishes state=OFF on Pi4 broker
+              → Pi4 _on_lp_rly_mqtt_state(OFF): writes Firebase lower_porch_light/state=false
+                    → Pi5 SSE fires _on_firebase_lp_rly_cmd(False)
+                          → Pi5: _lp_rly_manual_off_time=now (suppresses radar 120s)
+              → Pi5 bridge receives state=OFF → Pi5 _on_lp_rly_mqtt_state(OFF)
+                    → is_master=False → firmware guard SKIPPED (no re-send ON)
+                    → Pi5: _last_lp_rly_cmd=False
+```
+
+**Radar motion → LP-RLY ON (both Pis night-time):**
+```
+ESP32-LP-RDR1 detects motion
+  ├── MQTT home/esp32/radar1/motion=ON → Pi4 broker
+  │     └── Pi4 _handle_radar_lp_rly(): checks _lp_rly_manual_off_time → sends ON
+  └── MQTT home/pi5/lp-rdr/motion=ON → Pi5 broker (direct)
+        └── Pi5 _do_radar_motion_on(): checks _lp_rly_manual_off_time → sends ON (if not suppressed)
+```
+Both Pis may send ON — that's idempotent (relay is already ON). The 120s `_lp_rly_manual_off_time` on each Pi independently suppresses radar re-trigger after manual OFF.
 
 ---
 
@@ -512,7 +575,9 @@ Pi5 checks `ip addr show wlan0` for `192.168.1.100` before sending:
 | ESP01 MQTT keepalive instability | Workaround in firmware | PubSubClient on ESP8266 drops at ~90 s; permanent fix = AsyncMqttClient (not yet done) |
 | Keepalived DISABLED | By design | JioFiber IP source guard blocked VIP traffic; .100 kept as static alias on Pi4 wlan0 for app backward compat |
 | Pi5 MQTT_HOST=localhost | By design | Pi5 mybot connects to its own broker; bridge from Pi4 delivers ESP events |
-| LL-RLY spurious ON on Pi5 start | FIXED 2026-06-23 | 6 methods missing VIP guard — firmware guard now gated on `is_master`; commit 74f996b |
+| LL-RLY spurious ON on Pi5 start | FIXED 2026-06-23 | 6 methods missing VIP guard — `except Exception: pass` (fail-open) let Pi5 act as master on subprocess timeout; changed to `except Exception: return`; commit 74f996b |
+| LP-RLY toggle loop (local HTTP path) | FIXED 2026-06-24 | 3 Pi5 bugs: (1) firmware auto-off guard in `_on_lp_rly_mqtt_state` had no `is_master` check — Pi5 immediately re-sent ON after Pi4's deliberate OFF because Pi5's stale `_last_lp_rly_cmd=True`; (2) Firebase write in same handler had no `is_master`; (3) `_do_radar_motion_on` had no `_lp_rly_manual_off_time` guard. commit fdf0585 |
+| Pi4 activate() state vars not set on MQTT-only success | FIXED 2026-06-23 | `_ll_motion_triggered` and `_last_living_room_cmd` only set when HTTP also succeeded; fixed with `sent=True` pattern (MQTT OR HTTP); commit 59c0edc |
 | ESP32-LP-RDR1 MQTT keepalive bug | FIXED 2026-06-16 | `setKeepAlive(60)` + `mqttClient.loop()` at start of loop; commit 107bfbb (needs OTA flash) |
 
 ---
