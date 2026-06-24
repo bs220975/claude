@@ -191,10 +191,38 @@ python3 -m venv --system-site-packages /home/pi5/myenv
 ### Pi5 — Aliases
 
 ```bash
+# Navigation
 cdmain        # cd to RASPI5-MAIN
 cdgit         # cd to /home/pi5/pi5_drive/Git_projects
-servicemybot  # journalctl -u mybot.service -f
-statusmqtt    # systemctl status mosquitto
+cdapp         # cd to HOMESECURITY-APP
+
+# mybot service
+stopmybot / startmybot / restartmybot / statusmybot / servicemybot
+copymybot     # copy mybot.service to /etc/systemd/system/
+enablemybot / reloadmybot
+
+# mqttdatainflux service
+stopmqtt / startmqtt / restartmqtt / statusmqtt / servicemqtt
+
+# All services together (handles VIP guard)
+startall      # start keepalived + mybot + mqttdatainflux (checks VIP first)
+stopall       # stop all services + release VIP
+statusall     # show status of all three services
+makepi4master # hand VIP to Pi4 (stops Pi5, starts Pi4 via SSH)
+makepi5master # hand VIP to Pi5 (stops Pi4 via SSH, starts Pi5)
+
+# Pi4 remote (via sshpass)
+sshpi4        # SSH into Pi4 (192.168.1.122)
+pi4startall   # run startall on Pi4 via SSH
+pi4stopall    # run stopall on Pi4 via SSH
+pi4statusall  # run statusall on Pi4 via SSH
+
+# Misc
+myenv         # source /home/pi5/myenv/bin/activate
+sync          # run sync.sh backup script
+backup        # run backup.sh
+gitpullall    # pull all Git repos
+copyalias     # copy .bash_aliases to repo backup
 ```
 
 ---
@@ -246,6 +274,44 @@ statusmqtt    # systemctl status mosquitto
 - Telegram direct alerts
 - Firebase RTDB direct write (app bulb sync)
 
+**OTA flash:**
+```bash
+cd /home/pi5/pi5_drive/Git_projects/ESP32-LP-RDR1
+/home/pi5/.platformio/penv/bin/pio run -e esp32_lp_rdr1_ota --target upload
+# Or via Telegram: /ota2
+# USB environment: esp32_lp_rdr1_usb
+```
+
+**Telegram bot commands (suffix "2", chat ID `6825638285`):**
+
+| Category | Commands |
+|----------|---------|
+| Status | `/start2` `/status2` `/info2` `/ping2` `/deviceid2` `/devices2` `/checkdevices2` |
+| Radar | `/radar_on2` `/radar_off2` `/radar_status2` |
+| WiFi | `/wifi2` `/wifi_current2` `/wifi_scan2` `/wifi_add2 SSID PASS` `/wifi_remove2 SSID` `/wifi_priority2 SSID N` `/wifi_connect2 SSID` `/wifi_clearall2` |
+| Device IPs | `/setlightip2 IP` `/setcameraip2 IP` `/dellightip2` `/delcameraip2` |
+| Maintenance | `/ota2` `/restart2` `/tgreset2` `/help2` |
+
+**NVS config (persisted in `"appcfg"` namespace):**
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `radar` | true | Radar motion enabled |
+| `porch_ip` | 192.168.1.111 | ESP01-UL-RLY IP |
+| `camera_ip` | 192.168.1.83 | Camera ESP IP |
+| `aws` | true | AWS IoT enabled |
+| `tg` | true | Telegram enabled |
+
+**Loop timers:**
+
+| Timer | Interval | Purpose |
+|-------|----------|---------|
+| `pollFirebaseForLobbyState` | 2 s | Read app-commanded state |
+| `checkESP01Health` | 30 s | Ping ESP01 + write heartbeat to Firebase |
+| Radar debounce | 300 ms | Signal must be stable before state change |
+| Motion light-off | 5 min | Turn off porch light after last motion |
+| AWS shadow heartbeat | 120 s | Device status shadow update |
+
 ### ESP01-LL-RLY — Lower Lobby Light Relay
 
 | Item | Value |
@@ -264,10 +330,21 @@ statusmqtt    # systemctl status mosquitto
 | `home/esp01/lower-lobby/state` | OUT (retained) | Current relay state |
 | `home/esp01/lower-lobby/availability` | OUT | `online` / `offline` LWT |
 
+**HTTP API:** `GET /lighton`, `GET /lightoff`, `GET /status`
+**MQTT client ID:** `esp01-lower-lobby-relay`
+
 **Notes:**
 - ESP8266 PubSubClient keepalive instability: broker drops at ~90 s; workaround in firmware (stop+delay before reconnect, WIFI_NONE_SLEEP, 10 s heartbeat)
 - Pi4 has HTTP fallback (`/lighton`, `/lightoff`) for reliability
-- 3-min firmware auto-off timer — Pi tracks `_ll_motion_triggered` flag to re-send ON if light was manual/scheduled
+- Firmware auto-off: **DISABLED** (`LIGHT_AUTO_OFF_MS=0`) — Pi controls all timers
+
+**OTA flash** (run from Pi4):
+```bash
+cd /home/pi/pi4_drive/Git_projects/ESP01-LL-RLY
+~/.platformio/penv/bin/platformio run -e esp01_relay_ota --target upload
+# OTA hostname: ESP01-LL-RLY  upload port: 192.168.1.85
+# ⚠️ After USB flash: power cycle required before OTA works
+```
 
 ### ESP01-UL-RLY — Upper Lobby Light Relay (Porch)
 
@@ -287,10 +364,30 @@ statusmqtt    # systemctl status mosquitto
 | `home/esp01/upper-lobby/state` | OUT (retained) | Current relay state |
 | `home/esp01/upper-lobby/availability` | OUT | `online` / `offline` LWT |
 
+**HTTP endpoints (served on port 80):** `GET /lighton`, `GET /lightoff`, `GET /status`
+**OTA hostname:** `esp01-relay`
+
 **Notes:**
 - Does NOT talk to Firebase directly — ESP32-LP-RDR1 proxies Firebase for it
-- Polls ESP32-LP-RDR1 (port 81) every 1 s for commanded state
-- ESP32-LP-RDR1 sends motion-triggered relay commands direct via HTTP
+- Polls ESP32-LP-RDR1 (`GET :81/relay/lobby/state`) every 1 s for commanded state
+- Reports confirmed back (`GET :81/relay/lobby/confirmed?state=true`) → ESP32 writes to Firebase
+- ESP32-LP-RDR1 sends motion-triggered relay commands direct via HTTP (up to 3 retries)
+- 3-min firmware auto-off safety timer (safety net only — ESP32's 5-min timer manages this)
+
+**App → relay flow (total ~3–4 s):**
+```
+App tap → Firebase lights/lobby/state (~200ms)
+  └── ESP32-LP-RDR1 polls every 2s → caches s_lobbyCommandedState
+        └── ESP01-UL-RLY polls :81/relay/lobby/state every 1s
+              └── setRelay() → reportConfirmedToESP32()
+                    └── ESP32 writes lights/lobby/{state,confirmed} → App bulb
+```
+
+**Motion → relay (total ~300 ms on LAN):**
+```
+Radar HIGH → ESP32 isPorchLightTime()? → GET http://192.168.1.111/lighton (3 retries)
+  → relay clicks → ESP32 pushRelayStateToFirebase(true)
+```
 
 ### ESP32-LP-RLY — Lower Porch Light Relay
 
@@ -323,6 +420,24 @@ statusmqtt    # systemctl status mosquitto
 Both subscribe to the cmd topic. Pi5's bridge also forwards the cmd topic out to Pi4.
 
 **HTTP endpoints:** `GET /lighton`, `GET /lightoff`, `GET /status`
+
+**OTA flash:**
+```bash
+cd /home/pi5/pi5_drive/Git_projects/ESP32-LP-RLY
+/home/pi5/.platformio/penv/bin/pio run --target upload
+# OTA hostname: ESP32-LP-RLY  port: 3232  password: otaesp32
+# Firmware version 1.0.0 — increment before OTA push (same version = skipped)
+```
+
+### Camera ESP — Motion Photo Device
+
+| Item | Value |
+|------|-------|
+| Default IP | `192.168.1.83` |
+| Project | `/home/pi5/pi5_drive/Git_projects/ESP32-S3-XIAO-CAMERA/` |
+| Triggered by | ESP32-LP-RDR1 via `GET http://192.168.1.83/radar_trigger` (throttled 60 s) |
+| Purpose | Take photo on motion → send to Telegram |
+| NVS key on radar | `camera_ip` (default `192.168.1.83`, changeable via `/setcameraip2 IP`) |
 
 ---
 
@@ -673,82 +788,6 @@ adb uninstall com.homesecurity.alertapp
 # Logs
 adb logcat -s flutter
 ```
-
----
-
-## ESP Device Details — OTA & Telegram Commands
-
-### OTA Flash Commands (all devices)
-
-```bash
-# ESP32-LP-RDR1 (main radar, 192.168.1.87)
-cd /home/pi5/pi5_drive/Git_projects/ESP32-LP-RDR1
-/home/pi5/.platformio/penv/bin/pio run -e esp32_lp_rdr1_ota --target upload
-# Or via Telegram: /ota2
-
-# ESP01-LL-RLY (lower lobby, 192.168.1.85) — run from Pi4
-cd /home/pi/pi4_drive/Git_projects/ESP01-LL-RLY
-~/.platformio/penv/bin/platformio run -e esp01_relay_ota --target upload
-# OTA hostname: ESP01-LL-RLY  upload port: 192.168.1.85
-# ⚠️ After USB flash: power cycle required before OTA works
-
-# ESP01-UL-RLY (upper lobby, 192.168.1.111)
-# OTA hostname: esp01-relay
-
-# ESP32-LP-RLY (lower porch, 192.168.1.89)
-cd /home/pi5/pi5_drive/Git_projects/ESP32-LP-RLY
-/home/pi5/.platformio/penv/bin/pio run --target upload
-# OTA hostname: ESP32-LP-RLY  port: 3232  password: otaesp32
-```
-
-### ESP32-LP-RDR1 Telegram Bot Commands (suffix "2")
-
-All commands sent to chat ID `6825638285`, all end with `2`:
-
-| Category | Commands |
-|----------|---------|
-| Status | `/start2` `/status2` `/info2` `/ping2` `/deviceid2` `/devices2` `/checkdevices2` |
-| Radar | `/radar_on2` `/radar_off2` `/radar_status2` |
-| WiFi | `/wifi2` `/wifi_current2` `/wifi_scan2` `/wifi_add2 SSID PASS` `/wifi_remove2 SSID` `/wifi_priority2 SSID N` `/wifi_connect2 SSID` `/wifi_clearall2` |
-| Device IPs | `/setlightip2 IP` `/setcameraip2 IP` `/dellightip2` `/delcameraip2` |
-| Maintenance | `/ota2` `/restart2` `/tgreset2` `/help2` |
-
-### ESP32-LP-RDR1 NVS Config (persisted)
-
-| Key | Default | Purpose |
-|-----|---------|---------|
-| `radar` | true | Radar motion enabled |
-| `porch_ip` | 192.168.1.111 | ESP01-UL-RLY IP |
-| `camera_ip` | 192.168.1.83 | Camera ESP IP |
-| `aws` | true | AWS IoT enabled |
-| `tg` | true | Telegram enabled |
-
-### ESP01-UL-RLY Control Flow
-
-```
-App tap → Firebase lights/lobby/state
-  └── ESP32-LP-RDR1 polls every 2s → caches s_lobbyCommandedState
-        └── ESP01-UL-RLY polls :81/relay/lobby/state every 1s
-              └── setRelay() → reportConfirmedToESP32()
-                    └── ESP32 writes lights/lobby/{state,confirmed} → App bulb
-```
-
-**Timers:**
-- Firebase poll: 2 s
-- ESP01 poll: 1 s
-- ESP32 health check of ESP01: 30 s
-- Motion light-off timer: 5 min
-- ESP01 firmware auto-off: 3 min (safety net only — Pi manages all timers)
-- ESP01-LL-RLY auto-off: **DISABLED** (`LIGHT_AUTO_OFF_MS=0`) — Pi controls all timers
-
-### Camera ESP Device
-
-| Item | Value |
-|------|-------|
-| Default IP | `192.168.1.83` |
-| Project | `ESP32-S3-XIAO-CAMERA` or `ESP32-CAM` |
-| Triggered by | ESP32-LP-RDR1 via HTTP `GET /radar_trigger` (throttled 60 s) |
-| Purpose | Photo on motion → Telegram |
 
 ---
 
