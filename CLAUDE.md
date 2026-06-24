@@ -3,7 +3,7 @@
 Auto-loaded every session. Full context about all devices, projects, and how they connect.
 **Update this file whenever a device, topic, path, or architecture changes.**
 
-> **Brain last synced:** 2026-06-24 from Pi4 — stale memory files removed (`project_e2e_test_pending`, `project_mqtt_migration`). Cross-device pull test: verify this line appears on Pi5 launch.
+> **Brain last synced:** 2026-06-24 from Pi5 — stale memory files removed (`project_e2e_test_pending`, `project_mqtt_migration`). Cross-device pull test: verify this line appears on Pi5 launch.
 
 ---
 
