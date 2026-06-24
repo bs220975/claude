@@ -586,6 +586,73 @@ Pi reed switch → Path A: Firestore REST door_events/{doc_id}  (primary persist
 | `devices/ESP32-LP-RLY/` | LP relay state |
 | `schedules/` | Daily on/off timer settings per light |
 
+### Pi Local API (port 5757) — Full Endpoints
+
+Implemented in `RASPI5-MAIN/local_api_server.py`. Runs on both Pi4 and Pi5.
+
+| Method | Path | Request | Response | Purpose |
+|--------|------|---------|----------|---------|
+| GET | `/ping` | — | `{"ok": true}` | Reachability probe |
+| GET | `/identity` | — | `{"hostname": "pi5"}` | VIP-holder ID (Pi4 returns `"pi"`) |
+| GET | `/devices` | — | Device states JSON | All device states (same fields as Firebase) |
+| PUT | `/lights/{id}` | `{"state": true\|false}` | `{"ok": true}` | Toggle named light relay |
+
+**Notes:**
+- App queries `/identity` on VIP `192.168.1.100` to know which Pi is active
+- Pi4 hostname: `pi`, Pi5 hostname: `pi5` → displayed as `PI4`/`PI5` in app banner
+- 404 for any unknown path, 503 if `/devices` callback not wired
+
+### Firestore Light Device Schema
+
+Collection: `lights/{id}`
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `label` | String | Display name (e.g. "L-Porch-Light") |
+| `room` | String | Room label (e.g. "Porch") |
+| `on` | bool | App-commanded state (Firestore) |
+| `schedulable` | bool | Appears in scheduler if true |
+
+**Default lights** (seeded once via `seedDefaultLights()`):
+
+| id | label | room |
+|----|-------|------|
+| `lobby` | L-Porch-Light | Porch |
+| `living_room` | Living Room | Living Room |
+| `bedroom` | Bedroom | Bedroom |
+| `kitchen` | Kitchen | Kitchen |
+| `bathroom` | Bathroom | Bathroom |
+
+**State priority in app** (highest to lowest):
+1. `_optimistic[id]` — set on tap, instant UI update before network
+2. RTDB `lights/{id}/state` — app-commanded, arrives ~200ms
+3. RTDB `lights/{id}/confirmed` — device-confirmed after relay toggle
+4. Firestore `lights/{id}/on` — ground truth for all viewers
+
+**Toggle de-dupe:** `_pending` map drops a second call for same `id` while first is in-flight.
+
+### RTDB Light Schedule Schema
+
+Path: `schedules/{lightId}`
+
+| Field | Type | Example |
+|-------|------|---------|
+| `enabled` | bool | true |
+| `on_time` | String HH:MM | "18:00" |
+| `off_time` | String HH:MM | "06:00" |
+
+Only lights with `schedulable: true` in Firestore appear in the scheduler page.
+Pi reads these via SSE on `schedules/` and APScheduler fires at the set times.
+
+### App OTA System (Firebase)
+
+- **Firestore:** `ota_firmware/{deviceId}` — fields: `version`, `downloadUrl`, `fileName`, `uploadedAt`, `notes`
+- **Storage:** `firmware/{deviceId}/{fileName}` — raw `.bin` file
+- **RTDB flash command:** `commands/{deviceId}/ota` → `{"action": "start_ota", "url": ..., "version": ...}`
+- **RTDB flash status (ESP writes back):** `commands/{deviceId}/ota_status` → `{"status": "downloading|installing|complete|failed", "progress": 0-100}`
+- App uploads `.bin` from PC, writes Firestore record, then sends RTDB flash command
+- ESP32 polls Firestore for new version; if version != current, downloads and flashes
+
 ### App Build & Debug Commands
 
 ```bash
